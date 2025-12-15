@@ -19,12 +19,10 @@ mongoose.connect(MONGODB_URI, {
   console.error(err);
   process.exit(1);
 });
-
-// FIXED: Removed unique index on email and made it optional
 const userSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
   username: { type: String, required: true },
-  email: { type: String, sparse: true }, // sparse: true allows multiple null values
+  // email: { type: String, sparse: true }, // sparse: true allows multiple null values
   profilePic: { type: String, default: '' },
   createdAt: { type: Date, default: Date.now },
   interactions: [{
