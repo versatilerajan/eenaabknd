@@ -1,8 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 
 const app = express();
 
@@ -11,20 +9,22 @@ app.use(cors());
 app.use(express.json());
 
 // MongoDB Connection
-const MONGODB_URI = 'mongodb+srv://rr791337_db_user:kf8bhSmDKjcuxGJW@eenaadata.8nwhdpg.mongodb.net/votingApp?retryWrites=true&w=majority&appName=eenaadata';
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://rr791337_db_user:kf8bhSmDKjcuxGJW@eenaadata.8nwhdpg.mongodb.net/votingApp?retryWrites=true&w=majority&appName=eenaadata';
 
-mongoose.connect(MONGODB_URI)
+mongoose.connect(MONGODB_URI, {
+  serverSelectionTimeoutMS: 30000,
+  socketTimeoutMS: 45000,
+})
   .then(() => console.log('MongoDB Connected'))
   .catch(err => console.error('MongoDB connection error:', err));
 
 // ===== SCHEMAS =====
 
-// User Schema
+// User Schema (simplified - just for tracking, no auth)
 const userSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true },
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
+  userId: { type: String, required: true, unique: true }, // Can be Google ID or any identifier
+  username: { type: String, required: true },
+  email: { type: String },
   profilePic: { type: String, default: '' },
   createdAt: { type: Date, default: Date.now },
   // Interaction tracking for recommendations
@@ -34,21 +34,21 @@ const userSchema = new mongoose.Schema({
     timestamp: { type: Date, default: Date.now }
   }],
   interests: [{ type: String }], // Tags user interacts with most
-  followedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }]
 });
 
 // Post Schema
 const postSchema = new mongoose.Schema({
-  creator: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  creatorId: { type: String, required: true }, // User ID from frontend
+  creatorName: { type: String, required: true },
   title: { type: String, required: true },
   image: { type: String }, // Image URL
   options: [{
     text: { type: String, required: true },
     votes: { type: Number, default: 0 },
-    voters: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }]
+    voters: [{ type: String }] // Array of user IDs who voted
   }],
   totalVotes: { type: Number, default: 0 },
-  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  likes: [{ type: String }], // Array of user IDs who liked
   likesCount: { type: Number, default: 0 },
   shares: { type: Number, default: 0 },
   views: { type: Number, default: 0 },
@@ -62,28 +62,10 @@ const postSchema = new mongoose.Schema({
 // Index for recommendation queries
 postSchema.index({ trendingScore: -1, createdAt: -1 });
 postSchema.index({ tags: 1 });
-postSchema.index({ creator: 1 });
+postSchema.index({ creatorId: 1 });
 
 const User = mongoose.model('User', userSchema);
 const Post = mongoose.model('Post', postSchema);
-
-// ===== MIDDLEWARE =====
-
-// Auth Middleware
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
-    req.user = user;
-    next();
-  });
-};
 
 // ===== RECOMMENDATION ALGORITHM =====
 
@@ -108,10 +90,15 @@ const calculateEngagementScore = (post) => {
 
 // Get personalized feed
 const getPersonalizedFeed = async (userId, limit = 20, skip = 0) => {
-  const user = await User.findById(userId);
+  let user = await User.findOne({ userId });
   
+  // If user doesn't exist, return trending posts
   if (!user) {
-    throw new Error('User not found');
+    return await Post.find()
+      .sort({ trendingScore: -1, createdAt: -1 })
+      .limit(limit)
+      .skip(skip)
+      .lean();
   }
 
   // Get user's interest tags
@@ -124,28 +111,24 @@ const getPersonalizedFeed = async (userId, limit = 20, skip = 0) => {
   const posts = await Post.aggregate([
     {
       $match: {
-        _id: { $nin: interactedPostIds } // Exclude already seen posts
+        _id: { $nin: interactedPostIds }
       }
     },
     {
       $addFields: {
-        // Calculate relevance score
         relevanceScore: {
           $add: [
-            // Tag matching score
             {
               $multiply: [
                 { $size: { $setIntersection: ['$tags', userInterests] } },
                 10
               ]
             },
-            // Trending score
             '$trendingScore',
-            // Recency bonus
             {
               $divide: [
                 { $subtract: [Date.now(), '$createdAt'] },
-                1000000000 // Scale down
+                1000000000
               ]
             }
           ]
@@ -160,30 +143,13 @@ const getPersonalizedFeed = async (userId, limit = 20, skip = 0) => {
     },
     {
       $limit: limit
-    },
-    {
-      $lookup: {
-        from: 'users',
-        localField: 'creator',
-        foreignField: '_id',
-        as: 'creatorInfo'
-      }
-    },
-    {
-      $unwind: '$creatorInfo'
-    },
-    {
-      $project: {
-        'creatorInfo.password': 0,
-        'creatorInfo.interactions': 0
-      }
     }
   ]);
 
   return posts;
 };
 
-// Update trending scores (run periodically)
+// Update trending scores
 const updateTrendingScores = async () => {
   const posts = await Post.find();
   
@@ -203,69 +169,40 @@ app.get('/', (req, res) => {
   res.json({ message: 'Voting App API Running', status: 'OK' });
 });
 
-// ===== AUTH ROUTES =====
+// ===== USER ROUTES =====
 
-// Register
-app.post('/api/auth/register', async (req, res) => {
+// Create or get user
+app.post('/api/users', async (req, res) => {
   try {
-    const { username, email, password } = req.body;
+    const { userId, username, email, profilePic } = req.body;
 
-    // Check if user exists
-    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
-    if (existingUser) {
-      return res.status(400).json({ error: 'User already exists' });
+    if (!userId || !username) {
+      return res.status(400).json({ error: 'userId and username required' });
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
+    let user = await User.findOne({ userId });
 
-    // Create user
-    const user = new User({
-      username,
-      email,
-      password: hashedPassword
-    });
+    if (!user) {
+      user = new User({ userId, username, email, profilePic });
+      await user.save();
+    }
 
-    await user.save();
-
-    // Generate token
-    const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET);
-
-    res.status(201).json({
-      message: 'User registered successfully',
-      token,
-      user: { id: user._id, username, email }
-    });
+    res.json({ message: 'User ready', user });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Login
-app.post('/api/auth/login', async (req, res) => {
+// Get user by ID
+app.get('/api/users/:userId', async (req, res) => {
   try {
-    const { email, password } = req.body;
-
-    // Find user
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ userId: req.params.userId });
+    
     if (!user) {
-      return res.status(400).json({ error: 'Invalid credentials' });
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    // Check password
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(400).json({ error: 'Invalid credentials' });
-    }
-
-    // Generate token
-    const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET);
-
-    res.json({
-      message: 'Login successful',
-      token,
-      user: { id: user._id, username: user.username, email: user.email }
-    });
+    res.json({ user });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -274,12 +211,17 @@ app.post('/api/auth/login', async (req, res) => {
 // ===== POST ROUTES =====
 
 // Create post
-app.post('/api/posts', authenticateToken, async (req, res) => {
+app.post('/api/posts', async (req, res) => {
   try {
-    const { title, image, options, tags } = req.body;
+    const { creatorId, creatorName, title, image, options, tags } = req.body;
+
+    if (!creatorId || !creatorName || !title || !options) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
 
     const post = new Post({
-      creator: req.user.id,
+      creatorId,
+      creatorName,
       title,
       image,
       options: options.map(opt => ({ text: opt, votes: 0, voters: [] })),
@@ -294,13 +236,32 @@ app.post('/api/posts', authenticateToken, async (req, res) => {
   }
 });
 
-// Get personalized feed
-app.get('/api/posts/feed', authenticateToken, async (req, res) => {
+// Get all posts (with pagination)
+app.get('/api/posts', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 20;
     const skip = parseInt(req.query.skip) || 0;
 
-    const posts = await getPersonalizedFeed(req.user.id, limit, skip);
+    const posts = await Post.find()
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .skip(skip);
+
+    const total = await Post.countDocuments();
+
+    res.json({ posts, total, limit, skip });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get personalized feed
+app.get('/api/posts/feed/:userId', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const skip = parseInt(req.query.skip) || 0;
+
+    const posts = await getPersonalizedFeed(req.params.userId, limit, skip);
 
     res.json({ posts });
   } catch (error) {
@@ -315,8 +276,7 @@ app.get('/api/posts/trending', async (req, res) => {
 
     const posts = await Post.find()
       .sort({ trendingScore: -1, createdAt: -1 })
-      .limit(limit)
-      .populate('creator', 'username profilePic');
+      .limit(limit);
 
     res.json({ posts });
   } catch (error) {
@@ -325,10 +285,10 @@ app.get('/api/posts/trending', async (req, res) => {
 });
 
 // Get single post
-app.get('/api/posts/:id', authenticateToken, async (req, res) => {
+app.get('/api/posts/:id', async (req, res) => {
   try {
-    const post = await Post.findById(req.params.id)
-      .populate('creator', 'username profilePic');
+    const { userId } = req.query;
+    const post = await Post.findById(req.params.id);
 
     if (!post) {
       return res.status(404).json({ error: 'Post not found' });
@@ -338,15 +298,17 @@ app.get('/api/posts/:id', authenticateToken, async (req, res) => {
     post.views += 1;
     await post.save();
 
-    // Track user interaction
-    await User.findByIdAndUpdate(req.user.id, {
-      $push: {
-        interactions: {
+    // Track user interaction if userId provided
+    if (userId) {
+      const user = await User.findOne({ userId });
+      if (user) {
+        user.interactions.push({
           postId: post._id,
           type: 'view'
-        }
+        });
+        await user.save();
       }
-    });
+    }
 
     res.json({ post });
   } catch (error) {
@@ -355,9 +317,14 @@ app.get('/api/posts/:id', authenticateToken, async (req, res) => {
 });
 
 // Vote on post
-app.post('/api/posts/:id/vote', authenticateToken, async (req, res) => {
+app.post('/api/posts/:id/vote', async (req, res) => {
   try {
-    const { optionIndex } = req.body;
+    const { optionIndex, userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId required' });
+    }
+
     const post = await Post.findById(req.params.id);
 
     if (!post) {
@@ -366,7 +333,7 @@ app.post('/api/posts/:id/vote', authenticateToken, async (req, res) => {
 
     // Check if user already voted
     const hasVoted = post.options.some(opt => 
-      opt.voters.includes(req.user.id)
+      opt.voters.includes(userId)
     );
 
     if (hasVoted) {
@@ -375,26 +342,28 @@ app.post('/api/posts/:id/vote', authenticateToken, async (req, res) => {
 
     // Add vote
     post.options[optionIndex].votes += 1;
-    post.options[optionIndex].voters.push(req.user.id);
+    post.options[optionIndex].voters.push(userId);
     post.totalVotes += 1;
 
     await post.save();
 
     // Track interaction and update interests
-    const user = await User.findById(req.user.id);
-    user.interactions.push({
-      postId: post._id,
-      type: 'vote'
-    });
+    const user = await User.findOne({ userId });
+    if (user) {
+      user.interactions.push({
+        postId: post._id,
+        type: 'vote'
+      });
 
-    // Update user interests based on post tags
-    post.tags.forEach(tag => {
-      if (!user.interests.includes(tag)) {
-        user.interests.push(tag);
-      }
-    });
+      // Update user interests based on post tags
+      post.tags.forEach(tag => {
+        if (!user.interests.includes(tag)) {
+          user.interests.push(tag);
+        }
+      });
 
-    await user.save();
+      await user.save();
+    }
 
     res.json({ message: 'Vote recorded', post });
   } catch (error) {
@@ -403,34 +372,40 @@ app.post('/api/posts/:id/vote', authenticateToken, async (req, res) => {
 });
 
 // Like post
-app.post('/api/posts/:id/like', authenticateToken, async (req, res) => {
+app.post('/api/posts/:id/like', async (req, res) => {
   try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId required' });
+    }
+
     const post = await Post.findById(req.params.id);
 
     if (!post) {
       return res.status(404).json({ error: 'Post not found' });
     }
 
-    const hasLiked = post.likes.includes(req.user.id);
+    const hasLiked = post.likes.includes(userId);
 
     if (hasLiked) {
       // Unlike
-      post.likes = post.likes.filter(id => id.toString() !== req.user.id);
+      post.likes = post.likes.filter(id => id !== userId);
       post.likesCount -= 1;
     } else {
       // Like
-      post.likes.push(req.user.id);
+      post.likes.push(userId);
       post.likesCount += 1;
 
       // Track interaction
-      await User.findByIdAndUpdate(req.user.id, {
-        $push: {
-          interactions: {
-            postId: post._id,
-            type: 'like'
-          }
-        }
-      });
+      const user = await User.findOne({ userId });
+      if (user) {
+        user.interactions.push({
+          postId: post._id,
+          type: 'like'
+        });
+        await user.save();
+      }
     }
 
     await post.save();
@@ -442,8 +417,10 @@ app.post('/api/posts/:id/like', authenticateToken, async (req, res) => {
 });
 
 // Share post
-app.post('/api/posts/:id/share', authenticateToken, async (req, res) => {
+app.post('/api/posts/:id/share', async (req, res) => {
   try {
+    const { userId } = req.body;
+
     const post = await Post.findById(req.params.id);
 
     if (!post) {
@@ -454,14 +431,16 @@ app.post('/api/posts/:id/share', authenticateToken, async (req, res) => {
     await post.save();
 
     // Track interaction
-    await User.findByIdAndUpdate(req.user.id, {
-      $push: {
-        interactions: {
+    if (userId) {
+      const user = await User.findOne({ userId });
+      if (user) {
+        user.interactions.push({
           postId: post._id,
           type: 'share'
-        }
+        });
+        await user.save();
       }
-    });
+    }
 
     res.json({ message: 'Share recorded', post });
   } catch (error) {
@@ -470,13 +449,35 @@ app.post('/api/posts/:id/share', authenticateToken, async (req, res) => {
 });
 
 // Get user's posts
-app.get('/api/users/:id/posts', async (req, res) => {
+app.get('/api/users/:userId/posts', async (req, res) => {
   try {
-    const posts = await Post.find({ creator: req.params.id })
-      .sort({ createdAt: -1 })
-      .populate('creator', 'username profilePic');
+    const posts = await Post.find({ creatorId: req.params.userId })
+      .sort({ createdAt: -1 });
 
     res.json({ posts });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete post
+app.delete('/api/posts/:id', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const post = await Post.findById(req.params.id);
+
+    if (!post) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+
+    // Only creator can delete
+    if (post.creatorId !== userId) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    await Post.findByIdAndDelete(req.params.id);
+
+    res.json({ message: 'Post deleted' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
