@@ -1,45 +1,24 @@
 require('dotenv').config();
-
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-
-// =====================
-// APP INIT
-// =====================
 const app = express();
-
-// =====================
-// MIDDLEWARE
-// =====================
 app.use(cors());
 app.use(express.json());
-
-// =====================
-// DB CONNECTION
-// =====================
 const MONGODB_URI = process.env.MONGODB_URI;
-
 if (!MONGODB_URI) {
-  console.error('❌ MONGODB_URI missing in .env');
+  console.error('MONGODB_URI missing');
   process.exit(1);
 }
-
 mongoose.connect(MONGODB_URI, {
   serverSelectionTimeoutMS: 30000,
   socketTimeoutMS: 45000,
 })
-.then(() => console.log('✅ MongoDB Connected'))
+.then(() => console.log('MongoDB Connected'))
 .catch(err => {
-  console.error('❌ MongoDB connection error:', err);
+  console.error(err);
   process.exit(1);
 });
-
-// =====================
-// SCHEMAS
-// =====================
-
-// User Schema
 const userSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
   username: { type: String, required: true },
@@ -48,13 +27,11 @@ const userSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   interactions: [{
     postId: { type: mongoose.Schema.Types.ObjectId, ref: 'Post' },
-    type: { type: String, enum: ['view', 'vote', 'like', 'share'] },
+    type: { type: String },
     timestamp: { type: Date, default: Date.now }
   }],
-  interests: [{ type: String }],
+  interests: [{ type: String }]
 });
-
-// Post Schema
 const postSchema = new mongoose.Schema({
   creatorId: { type: String, required: true },
   creatorName: { type: String, required: true },
@@ -75,51 +52,37 @@ const postSchema = new mongoose.Schema({
   engagementScore: { type: Number, default: 0 },
   trendingScore: { type: Number, default: 0 }
 });
-
 postSchema.index({ trendingScore: -1, createdAt: -1 });
-postSchema.index({ tags: 1 });
-postSchema.index({ creatorId: 1 });
-
 const User = mongoose.model('User', userSchema);
 const Post = mongoose.model('Post', postSchema);
-
-// =====================
-// RECOMMENDATION LOGIC
-// =====================
-
 const calculateEngagementScore = (post) => {
   const ageInHours = (Date.now() - post.createdAt) / (1000 * 60 * 60);
-  const decayFactor = Math.exp(-ageInHours / 48);
-
-  const rawScore =
+  const decay = Math.exp(-ageInHours / 48);
+  const raw =
     post.totalVotes * 1 +
     post.likesCount * 0.5 +
     post.shares * 2 +
     post.views * 0.1;
-
-  return rawScore * decayFactor;
+  return raw * decay;
 };
 
 const getPersonalizedFeed = async (userId, limit = 20, skip = 0) => {
   const user = await User.findOne({ userId });
-
   if (!user) {
     return Post.find()
       .sort({ trendingScore: -1, createdAt: -1 })
       .limit(limit)
       .skip(skip);
   }
-
-  const interactedPostIds = user.interactions.map(i => i.postId);
-  const userInterests = user.interests || [];
-
+  const interacted = user.interactions.map(i => i.postId);
+  const interests = user.interests || [];
   return Post.aggregate([
-    { $match: { _id: { $nin: interactedPostIds } } },
+    { $match: { _id: { $nin: interacted } } },
     {
       $addFields: {
         relevanceScore: {
           $add: [
-            { $multiply: [{ $size: { $setIntersection: ['$tags', userInterests] } }, 10] },
+            { $multiply: [{ $size: { $setIntersection: ['$tags', interests] } }, 10] },
             '$trendingScore'
           ]
         }
@@ -130,7 +93,6 @@ const getPersonalizedFeed = async (userId, limit = 20, skip = 0) => {
     { $limit: limit }
   ]);
 };
-
 const updateTrendingScores = async () => {
   const posts = await Post.find();
   for (const post of posts) {
@@ -141,17 +103,10 @@ const updateTrendingScores = async () => {
     });
   }
 };
-
-// =====================
-// ROUTES
-// =====================
-
-// Health
 app.get('/', (req, res) => {
-  res.json({ status: 'OK', message: 'Voting App API Running' });
+  res.json({ message: 'Voting App API Running' });
 });
 
-// Create/Get User
 app.post('/api/users', async (req, res) => {
   try {
     const { userId, username, email, profilePic } = req.body;
@@ -170,8 +125,6 @@ app.post('/api/users', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-// Create Post
 app.post('/api/posts', async (req, res) => {
   try {
     const { creatorId, creatorName, title, image, options, tags } = req.body;
@@ -191,8 +144,6 @@ app.post('/api/posts', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-// Get Posts
 app.get('/api/posts', async (req, res) => {
   const limit = +req.query.limit || 20;
   const skip = +req.query.skip || 0;
@@ -205,30 +156,41 @@ app.get('/api/posts', async (req, res) => {
   res.json({ posts });
 });
 
-// Vote
+app.get('/api/posts/feed/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const posts = await getPersonalizedFeed(userId);
+    const formatted = posts.map(p => ({
+      _id: p._id,
+      title: p.title,
+      options: p.options,
+      totalVotes: p.totalVotes ?? p.options.reduce((a, b) => a + b.votes, 0),
+      creatorName: p.creatorName,
+      createdAt: p.createdAt
+    }));
+    res.json({ posts: formatted });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/posts/:id/vote', async (req, res) => {
   try {
     const { optionIndex, userId } = req.body;
     const post = await Post.findById(req.params.id);
-
     if (!post) return res.status(404).json({ error: 'Post not found' });
-
     if (post.options.some(o => o.voters.includes(userId))) {
       return res.status(400).json({ error: 'Already voted' });
     }
-
     post.options[optionIndex].votes++;
     post.options[optionIndex].voters.push(userId);
     post.totalVotes++;
-
     await post.save();
     res.json({ post });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
-// Like
 app.post('/api/posts/:id/like', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -242,22 +204,15 @@ app.post('/api/posts/:id/like', async (req, res) => {
       post.likes.push(userId);
       post.likesCount++;
     }
-
     await post.save();
     res.json({ post });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
 setInterval(updateTrendingScores, 10 * 60 * 1000);
-
-// =====================
-// SERVER
-// =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
-
 module.exports = app;
