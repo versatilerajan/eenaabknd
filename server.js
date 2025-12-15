@@ -1,65 +1,81 @@
+require('dotenv').config();
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 
+// =====================
+// APP INIT
+// =====================
 const app = express();
 
-// Middleware
+// =====================
+// MIDDLEWARE
+// =====================
 app.use(cors());
 app.use(express.json());
 
-// MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://rr791337_db_user:kf8bhSmDKjcuxGJW@eenaadata.8nwhdpg.mongodb.net/votingApp?retryWrites=true&w=majority&appName=eenaadata';
+// =====================
+// DB CONNECTION
+// =====================
+const MONGODB_URI = process.env.MONGODB_URI;
+
+if (!MONGODB_URI) {
+  console.error('❌ MONGODB_URI missing in .env');
+  process.exit(1);
+}
 
 mongoose.connect(MONGODB_URI, {
   serverSelectionTimeoutMS: 30000,
   socketTimeoutMS: 45000,
 })
-  .then(() => console.log('MongoDB Connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+.then(() => console.log('✅ MongoDB Connected'))
+.catch(err => {
+  console.error('❌ MongoDB connection error:', err);
+  process.exit(1);
+});
 
-// ===== SCHEMAS =====
+// =====================
+// SCHEMAS
+// =====================
 
-// User Schema (simplified - just for tracking, no auth)
+// User Schema
 const userSchema = new mongoose.Schema({
-  userId: { type: String, required: true, unique: true }, // Can be Google ID or any identifier
+  userId: { type: String, required: true, unique: true },
   username: { type: String, required: true },
   email: { type: String },
   profilePic: { type: String, default: '' },
   createdAt: { type: Date, default: Date.now },
-  // Interaction tracking for recommendations
   interactions: [{
     postId: { type: mongoose.Schema.Types.ObjectId, ref: 'Post' },
     type: { type: String, enum: ['view', 'vote', 'like', 'share'] },
     timestamp: { type: Date, default: Date.now }
   }],
-  interests: [{ type: String }], // Tags user interacts with most
+  interests: [{ type: String }],
 });
 
 // Post Schema
 const postSchema = new mongoose.Schema({
-  creatorId: { type: String, required: true }, // User ID from frontend
+  creatorId: { type: String, required: true },
   creatorName: { type: String, required: true },
   title: { type: String, required: true },
-  image: { type: String }, // Image URL
+  image: { type: String },
   options: [{
     text: { type: String, required: true },
     votes: { type: Number, default: 0 },
-    voters: [{ type: String }] // Array of user IDs who voted
+    voters: [{ type: String }]
   }],
   totalVotes: { type: Number, default: 0 },
-  likes: [{ type: String }], // Array of user IDs who liked
+  likes: [{ type: String }],
   likesCount: { type: Number, default: 0 },
   shares: { type: Number, default: 0 },
   views: { type: Number, default: 0 },
   tags: [{ type: String }],
   createdAt: { type: Date, default: Date.now },
-  // Engagement metrics for recommendation algorithm
   engagementScore: { type: Number, default: 0 },
   trendingScore: { type: Number, default: 0 }
 });
 
-// Index for recommendation queries
 postSchema.index({ trendingScore: -1, createdAt: -1 });
 postSchema.index({ tags: 1 });
 postSchema.index({ creatorId: 1 });
@@ -67,433 +83,181 @@ postSchema.index({ creatorId: 1 });
 const User = mongoose.model('User', userSchema);
 const Post = mongoose.model('Post', postSchema);
 
-// ===== RECOMMENDATION ALGORITHM =====
+// =====================
+// RECOMMENDATION LOGIC
+// =====================
 
-// Calculate engagement score
 const calculateEngagementScore = (post) => {
   const ageInHours = (Date.now() - post.createdAt) / (1000 * 60 * 60);
-  const decayFactor = Math.exp(-ageInHours / 48); // 48-hour half-life
-  
-  const voteWeight = 1;
-  const likeWeight = 0.5;
-  const shareWeight = 2;
-  const viewWeight = 0.1;
-  
-  const rawScore = 
-    (post.totalVotes * voteWeight) +
-    (post.likesCount * likeWeight) +
-    (post.shares * shareWeight) +
-    (post.views * viewWeight);
-  
+  const decayFactor = Math.exp(-ageInHours / 48);
+
+  const rawScore =
+    post.totalVotes * 1 +
+    post.likesCount * 0.5 +
+    post.shares * 2 +
+    post.views * 0.1;
+
   return rawScore * decayFactor;
 };
 
-// Get personalized feed
 const getPersonalizedFeed = async (userId, limit = 20, skip = 0) => {
-  let user = await User.findOne({ userId });
-  
-  // If user doesn't exist, return trending posts
+  const user = await User.findOne({ userId });
+
   if (!user) {
-    return await Post.find()
+    return Post.find()
       .sort({ trendingScore: -1, createdAt: -1 })
       .limit(limit)
-      .skip(skip)
-      .lean();
+      .skip(skip);
   }
 
-  // Get user's interest tags
-  const userInterests = user.interests || [];
-  
-  // Get IDs of posts user already interacted with
   const interactedPostIds = user.interactions.map(i => i.postId);
-  
-  // Build recommendation pipeline
-  const posts = await Post.aggregate([
-    {
-      $match: {
-        _id: { $nin: interactedPostIds }
-      }
-    },
+  const userInterests = user.interests || [];
+
+  return Post.aggregate([
+    { $match: { _id: { $nin: interactedPostIds } } },
     {
       $addFields: {
         relevanceScore: {
           $add: [
-            {
-              $multiply: [
-                { $size: { $setIntersection: ['$tags', userInterests] } },
-                10
-              ]
-            },
-            '$trendingScore',
-            {
-              $divide: [
-                { $subtract: [Date.now(), '$createdAt'] },
-                1000000000
-              ]
-            }
+            { $multiply: [{ $size: { $setIntersection: ['$tags', userInterests] } }, 10] },
+            '$trendingScore'
           ]
         }
       }
     },
-    {
-      $sort: { relevanceScore: -1, createdAt: -1 }
-    },
-    {
-      $skip: skip
-    },
-    {
-      $limit: limit
-    }
+    { $sort: { relevanceScore: -1, createdAt: -1 } },
+    { $skip: skip },
+    { $limit: limit }
   ]);
-
-  return posts;
 };
 
-// Update trending scores
 const updateTrendingScores = async () => {
   const posts = await Post.find();
-  
   for (const post of posts) {
-    const engagementScore = calculateEngagementScore(post);
+    const score = calculateEngagementScore(post);
     await Post.findByIdAndUpdate(post._id, {
-      engagementScore,
-      trendingScore: engagementScore
+      engagementScore: score,
+      trendingScore: score
     });
   }
 };
 
-// ===== ROUTES =====
+// =====================
+// ROUTES
+// =====================
 
-// Health check
+// Health
 app.get('/', (req, res) => {
-  res.json({ message: 'Voting App API Running', status: 'OK' });
+  res.json({ status: 'OK', message: 'Voting App API Running' });
 });
 
-// ===== USER ROUTES =====
-
-// Create or get user
+// Create/Get User
 app.post('/api/users', async (req, res) => {
   try {
     const { userId, username, email, profilePic } = req.body;
-
     if (!userId || !username) {
-      return res.status(400).json({ error: 'userId and username required' });
+      return res.status(400).json({ error: 'userId & username required' });
     }
 
     let user = await User.findOne({ userId });
-
     if (!user) {
       user = new User({ userId, username, email, profilePic });
       await user.save();
     }
 
-    res.json({ message: 'User ready', user });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get user by ID
-app.get('/api/users/:userId', async (req, res) => {
-  try {
-    const user = await User.findOne({ userId: req.params.userId });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
     res.json({ user });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ===== POST ROUTES =====
-
-// Create post
+// Create Post
 app.post('/api/posts', async (req, res) => {
   try {
     const { creatorId, creatorName, title, image, options, tags } = req.body;
-
-    if (!creatorId || !creatorName || !title || !options) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
 
     const post = new Post({
       creatorId,
       creatorName,
       title,
       image,
-      options: options.map(opt => ({ text: opt, votes: 0, voters: [] })),
+      options: options.map(o => ({ text: o })),
       tags: tags || []
     });
 
     await post.save();
-
-    res.status(201).json({ message: 'Post created', post });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(201).json({ post });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// Get all posts (with pagination)
+// Get Posts
 app.get('/api/posts', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = parseInt(req.query.skip) || 0;
+  const limit = +req.query.limit || 20;
+  const skip = +req.query.skip || 0;
 
-    const posts = await Post.find()
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .skip(skip);
+  const posts = await Post.find()
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .skip(skip);
 
-    const total = await Post.countDocuments();
-
-    res.json({ posts, total, limit, skip });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  res.json({ posts });
 });
 
-// Get personalized feed
-app.get('/api/posts/feed/:userId', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = parseInt(req.query.skip) || 0;
-
-    const posts = await getPersonalizedFeed(req.params.userId, limit, skip);
-
-    res.json({ posts });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get trending posts
-app.get('/api/posts/trending', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 20;
-
-    const posts = await Post.find()
-      .sort({ trendingScore: -1, createdAt: -1 })
-      .limit(limit);
-
-    res.json({ posts });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get single post
-app.get('/api/posts/:id', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    const post = await Post.findById(req.params.id);
-
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-
-    // Track view
-    post.views += 1;
-    await post.save();
-
-    // Track user interaction if userId provided
-    if (userId) {
-      const user = await User.findOne({ userId });
-      if (user) {
-        user.interactions.push({
-          postId: post._id,
-          type: 'view'
-        });
-        await user.save();
-      }
-    }
-
-    res.json({ post });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Vote on post
+// Vote
 app.post('/api/posts/:id/vote', async (req, res) => {
   try {
     const { optionIndex, userId } = req.body;
-
-    if (!userId) {
-      return res.status(400).json({ error: 'userId required' });
-    }
-
     const post = await Post.findById(req.params.id);
 
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
+    if (!post) return res.status(404).json({ error: 'Post not found' });
 
-    // Check if user already voted
-    const hasVoted = post.options.some(opt => 
-      opt.voters.includes(userId)
-    );
-
-    if (hasVoted) {
+    if (post.options.some(o => o.voters.includes(userId))) {
       return res.status(400).json({ error: 'Already voted' });
     }
 
-    // Add vote
-    post.options[optionIndex].votes += 1;
+    post.options[optionIndex].votes++;
     post.options[optionIndex].voters.push(userId);
-    post.totalVotes += 1;
+    post.totalVotes++;
 
     await post.save();
-
-    // Track interaction and update interests
-    const user = await User.findOne({ userId });
-    if (user) {
-      user.interactions.push({
-        postId: post._id,
-        type: 'vote'
-      });
-
-      // Update user interests based on post tags
-      post.tags.forEach(tag => {
-        if (!user.interests.includes(tag)) {
-          user.interests.push(tag);
-        }
-      });
-
-      await user.save();
-    }
-
-    res.json({ message: 'Vote recorded', post });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.json({ post });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// Like post
+// Like
 app.post('/api/posts/:id/like', async (req, res) => {
   try {
     const { userId } = req.body;
-
-    if (!userId) {
-      return res.status(400).json({ error: 'userId required' });
-    }
-
     const post = await Post.findById(req.params.id);
 
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-
-    const hasLiked = post.likes.includes(userId);
-
-    if (hasLiked) {
-      // Unlike
-      post.likes = post.likes.filter(id => id !== userId);
-      post.likesCount -= 1;
+    const idx = post.likes.indexOf(userId);
+    if (idx > -1) {
+      post.likes.splice(idx, 1);
+      post.likesCount--;
     } else {
-      // Like
       post.likes.push(userId);
-      post.likesCount += 1;
-
-      // Track interaction
-      const user = await User.findOne({ userId });
-      if (user) {
-        user.interactions.push({
-          postId: post._id,
-          type: 'like'
-        });
-        await user.save();
-      }
+      post.likesCount++;
     }
 
     await post.save();
-
-    res.json({ message: hasLiked ? 'Unliked' : 'Liked', post });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.json({ post });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// Share post
-app.post('/api/posts/:id/share', async (req, res) => {
-  try {
-    const { userId } = req.body;
-
-    const post = await Post.findById(req.params.id);
-
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-
-    post.shares += 1;
-    await post.save();
-
-    // Track interaction
-    if (userId) {
-      const user = await User.findOne({ userId });
-      if (user) {
-        user.interactions.push({
-          postId: post._id,
-          type: 'share'
-        });
-        await user.save();
-      }
-    }
-
-    res.json({ message: 'Share recorded', post });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get user's posts
-app.get('/api/users/:userId/posts', async (req, res) => {
-  try {
-    const posts = await Post.find({ creatorId: req.params.userId })
-      .sort({ createdAt: -1 });
-
-    res.json({ posts });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Delete post
-app.delete('/api/posts/:id', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    const post = await Post.findById(req.params.id);
-
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-
-    // Only creator can delete
-    if (post.creatorId !== userId) {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    await Post.findByIdAndDelete(req.params.id);
-
-    res.json({ message: 'Post deleted' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ===== BACKGROUND TASKS =====
-
-// Update trending scores every 10 minutes
 setInterval(updateTrendingScores, 10 * 60 * 1000);
 
-// ===== START SERVER =====
-
+// =====================
+// SERVER
+// =====================
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
 
 module.exports = app;
